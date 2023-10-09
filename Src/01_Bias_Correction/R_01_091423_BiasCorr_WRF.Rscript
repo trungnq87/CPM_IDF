@@ -1,0 +1,104 @@
+# Using CDFt packages
+library("CDFt")
+
+# Using packages for reading arguments
+library("optparse")
+ 
+option_list = list(
+    make_option(c("-o", "--observation"), type="character", default=NULL, help="Observation (reference) data file", metavar="character"),
+    make_option(c("-s", "--simulation"), type="character", default=NULL, help="Simulation from WRF model (normally historical period)", metavar="character"),
+    make_option(c("-p", "--projection"), type="character", default=NULL, help="Future projecion from WRF model (can be historical period to use conventional quantile mapping)", metavar="character"),
+    make_option(c("-b", "--biascorrected"), type="character", default=NULL, help="Bias corrected output file", metavar="character"),
+    make_option(c("-v", "--validation"), type="character", default=NULL, help="Few statistical validations, e.g., CramerVonMises, KolmogorovSmirnov", metavar="character")
+); 
+ 
+# Function for applying CDFt
+f_cdft <- function (O, Gp, Gf) {
+  # Use the CDFt method
+  CT <- CDFt(O,Gp,Gf)
+  ds <- CT$DS
+  # 
+  return(ds)
+}
+
+# Funtion for "Singularity Stochastic Removal" (SSR)
+ssr <- function (t, th) {
+  # Over careful guy !
+  t_new <- t
+  # A random variable distributed uniformly between 0 and th
+  # "runif() will not generate either of the extreme values 
+  # unless max = min or max-min is small compared to min !
+  z <- runif(length(t_new), min=0, max=th)
+  # Replacing
+  id <- t_new == 0 & !is.na(t_new)
+  t_new[id] <- z[id]
+  #
+  return(t_new)
+}
+
+# Read arguments 
+opt_parser = OptionParser(option_list=option_list);
+opt = parse_args(opt_parser);
+
+if (is.null(opt$observation)){
+  print_help(opt_parser)
+  stop("At least one argument must be supplied (input file).n", call.=FALSE)
+}
+
+# Read station data
+obs <- read.csv(file = opt$observation)
+
+# Read historical simulations
+his <- read.csv(file = opt$simulation)
+
+# Read future projections
+pro <- read.csv(file = opt$projection)
+
+# Take "Time" column for bias-corrected data
+out <- data.frame(pro[,1])
+colnames(out)[ncol(out)] <- 'Time'
+
+# Saving some statistics test
+statout <- data.frame(matrix(ncol=4, nrow=0))
+tmp <- c('CVM_before','CVM_after','KS_before','KS_after')
+colnames(statout) <- tmp
+
+# First columns is "Time"
+for ( i in colnames(obs)[2:length(colnames(obs))]) {
+
+  # Get one series each time
+  O <- as.numeric(obs[,i])
+  Gp <- as.numeric(his[,i])
+  Gf <- as.numeric(pro[,i])
+
+  # Determine a positive precipitation threshold th
+  th <- min(O[O>0], Gp[Gp>0], Gf[Gf>0], na.rm=TRUE)
+  
+  # Singularity Stochastic Removal
+  O_ssr <- ssr(O,th)
+  Gp_ssr <- ssr(Gp,th)
+  Gf_ssr <- ssr(Gf,th)
+  
+  # Now use CDFt function
+  bc <- f_cdft(O_ssr, Gp_ssr, Gf_ssr)
+  
+  # Bias-corrected data lower than th are set to 0
+  bc[bc < th] <- 0
+  
+  # Add to output
+  out[,i] <- bc
+  colnames(out)[ncol(out)] <- paste(i)
+  
+  # Some statistics tests
+  cvm_b <- CramerVonMisesTwoSamples(O,Gf)
+  cvm_a <- CramerVonMisesTwoSamples(O,bc)
+  
+  ks_b <- KolmogorovSmirnov(O,Gf)
+  ks_a <- KolmogorovSmirnov(O,bc)
+  
+  statout[nrow(statout) + 1, ] <- c(cvm_b,cvm_a,ks_b,ks_a)
+}
+
+# Write output
+write.csv(out,file = opt$biascorrected, row.names=FALSE)
+write.csv(statout,file = opt$validation, row.names=FALSE)

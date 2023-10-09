@@ -1,0 +1,210 @@
+# Use extRemes package
+library("extRemes")
+
+# Still server-dependent 
+# Oct 3 2023 : on Quartz IU HPC
+# module swap r/4.2.1 r/4.3.1
+# Installed "fixIDF" by
+# Sys.setenv(R_REMOTES_NO_ERRORS_FROM_WARNINGS=TRUE)
+# library(devtools)
+# install_github("ClimDesign/fixIDF",ref="main") <= option 3, no update at all
+# folowed https://github.com/ClimDesign/fixIDF
+
+# Library
+library('fixIDF')
+
+# Using packages for reading arguments
+library("optparse")
+ 
+option_list = list(
+    make_option(c("-i", "--inputdata"), type="character", default=NULL, help="Input data file", metavar="character"),
+    make_option(c("-g", "--gevfile"), type="character", default=NULL, help="Output file:  GEV fitting", metavar="character"),
+    make_option(c("-o", "--idffile"), type="character", default=NULL, help="Output file:  IDF curves", metavar="character"),
+    make_option(c("-a", "--alpha"), type="double", default=NULL, help="Alpha for likelihood ratio test"),
+    make_option(c("-b", "--nbootstrap"), type="integer", default=NULL, help="Number of bootstrap sample"),
+    make_option(c("-d", "--durationinmin"), type="character", default=NULL, help="Duration in mins (well!)"),
+    make_option(c("-f", "--frequency"), type="character", default=NULL, help="Rainfall frequency that you want to fitting GEV", metavar="character")
+); 
+
+# Read arguments 
+opt_parser = OptionParser(option_list=option_list);
+opt = parse_args(opt_parser);
+
+if (is.null(opt$inputdata)){
+  print_help(opt_parser)
+  stop("At least one argument must be supplied (input file).n", call.=FALSE)
+}
+
+# Read data
+raw <- read.csv(opt$inputdata, header=TRUE)
+
+# Choose alpha for likelihood ratio test
+# and also CI for bootstrap in the former version (!)
+alpha <- opt$alpha
+
+# Choose number of bootstrapping time
+nboot <- opt$nbootstrap
+
+# Frequency that you want to test
+ff <- opt$frequency
+freq <- as.numeric(unlist(strsplit(ff, ",")))
+
+# Durations in mins (as needed for IDF fixing step)
+dd <- opt$durationinmin
+duration <- as.numeric(unlist(strsplit(dd, ",")))
+
+# Function for fitting GEV distribution
+# Find CI of ERL and distribution of parameters
+# Selecting "non-stationary" or stationary by ifnon
+gev_fitting <- function (ifnon, fit, yr, fq, nr, p, dur) {
+  #
+  # Currently, the ci function does not work for effective
+  # return levels. There were coding issues encountered.
+  # But, could try:
+  #
+  z <- rextRemes(fit, n=nr)
+  # "nr" (e.g., 1000) randomly drawn samples from the
+  # fitted model. Each row is a sample
+  # of data from the fitted model of the
+  # same length as the data. Each column
+  # is a separate sample.
+  sam <- numeric(0)
+  # I still want to save the CI of ERL
+  # for uncertainty assessment (in future!)
+  #
+  # "stnr" or station ID/number will be '1' now
+  # No need to add it, but we can, if we want !
+  #
+  theta <- data.frame(matrix(ncol=5, nrow=0))
+  tmp <- c('stnr','duration','location','scale','shape')
+  colnames(theta) <- tmp
+  #
+  if ( ifnon ) {
+      for( i in 1:nr) {
+          dat <- data.frame(z=z[,i], annee=yr)
+          res <- fevd(z, dat, location.fun=~annee, method="GMLE")
+          sam <- cbind(sam, c(erlevd(res)))
+          # Get fitting parameters
+          para <- findpars(res)
+          # Oh, lengthy commands, I should be more pro with R ? 
+          location <- as.numeric(para$location[length(para$location)])
+          scale <- as.numeric(para$scale[length(para$scale)])
+          shape <- as.numeric(para$shape[length(para$shape)])
+          #
+          theta[nrow(theta) + 1, ] <- c(as.numeric(1),as.numeric(dur),location,scale,shape)
+          #
+          }
+  } else {
+      for( i in 1:nr) {
+          a <- rextRemes(fit, n=length(yr))
+          dat <- data.frame(z=a)
+          res <- fevd(z, dat, method="GMLE")
+          sam <- cbind(sam, c(erlevd(res, period=fq)))
+          # Get fitting parameters
+          para <- findpars(res)
+          # Oh, lengthy commands, I should be more pro with R ? 
+          location <- as.numeric(para$location[length(para$location)])
+          scale <- as.numeric(para$scale[length(para$scale)])
+          shape <- as.numeric(para$shape[length(para$shape)])
+          #
+          theta[nrow(theta) + 1, ] <- c(as.numeric(1),as.numeric(dur),location,scale,shape)
+          }
+  }
+  #
+  res <- apply(sam, 1, quantile, probs=c(p/2, 1 - p/2))
+  # If you need "names", uncomment this line
+  #nm <- rownames(res)
+  res <- cbind(res[1,], res[2,])
+  # Skip column names
+  #colnames(res) <- c(nm[1], nm[2])
+  # ATTENTION: the last row idea !!! Hum,...
+  # Deal with non-stationary for RCP 4.5 and RCP 8.5
+  # Not really good idea, but what else ?
+  # Note: maximum or middle point is also controversial !
+  return(list("erl" = as.numeric(tail(res, n=1)), "theta" = theta))
+}
+
+# The first type of output files
+# Saving non-stationary flag, low/high range of return levels
+out01 <- data.frame(matrix(ncol=3, nrow=0))
+tmp <- c('Non-stationary flag','Low','High')
+colnames(out01) <- tmp
+
+# Drop NaN values
+# You can try to not drop NaN for all columns
+# But let keep it "synchronized" first
+df <- na.omit(raw)
+yr <- as.numeric(df[,"Year"])
+
+# Data preparation for "fixIDF" step
+gev_out <- data.frame(matrix(ncol=5, nrow=0))
+tmp <- c('stnr','duration','location','scale','shape')
+colnames(gev_out) <- tmp
+
+# I should learn R better to avoid this kind of command lines
+count <- 0
+
+# Loops for all frequencies and durations
+for ( j in freq ) {
+
+  ii <- 0
+
+  # First columns of df is "Year"
+  for ( i in colnames(df)[2:length(colnames(df))]) {
+  
+    # Counting
+    count <- count + 1 
+    ii <- ii + 1
+
+    # Get one series to test
+    a <- as.numeric(df[,i])
+    
+    # Fit stationary GEV
+    fit1 <- fevd(a, method="GMLE")
+    
+    # Fit non-stationary GEV (co-variate with ~Year)
+    fit2 <- fevd(a, location.fun=~yr, method="GMLE")
+    
+    # Likelihood ratio test
+    ## Get only p-value (still story of CI, but later)
+    p = lr.test(fit1,fit2)$p.value
+    
+    flag=0
+    # Now you know which one is more suitable
+    # 'Y' : nonstationary and 'N' : stationary
+    if ( p < alpha ) {
+      flag='Y'
+      tmp <- gev_fitting(TRUE, fit2, yr, j, nboot, alpha, duration[ii])
+    } else {
+      flag='N'
+      tmp <- gev_fitting(FALSE, fit1, yr, j, nboot, alpha, duration[ii])
+    }
+  
+    # Get "theta" array for compute_quantiles()
+    gev_out <- rbind(gev_out,tmp$theta)
+
+    # Save array to write output later
+    out01[nrow(out01) + 1, ] <- c(flag,tmp$erl)
+ }
+}
+
+# Write output of range for ERL in gev_fitting
+write.csv(out01,file = opt$gevfile, row.names=FALSE)
+
+# Now, quantile selection algorithm
+
+# Computing the return levels’ posterior quantiles
+quant_bay=compute_quantiles(gev_out,ret.period=freq)
+
+# Adjust IDF curves
+# "searches for a consistent set of return levels 
+# within the return levels’ 1-99 % posterior quantiles, 
+# and prefers solutions as close as possible
+# to the posterior median"
+res_alg=fixcurves_alg(quant_bay,maxit=1000,save.history=TRUE,seed=6)
+
+# There will be a message printed to screen !
+out02 <- res_alg$adjusted.curves
+
+# Saving IDF curves output
+write.csv(out02,file = opt$idffile)
