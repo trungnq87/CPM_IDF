@@ -1,0 +1,154 @@
+# Using CDFt packages
+library("CDFt")
+
+# Using packages for reading arguments
+library("optparse")
+ 
+option_list = list(
+    make_option(c("-t", "--type"), type="character", default=NULL, help="Traditional QM or CDFt", metavar="character"),
+    make_option(c("-o", "--observation"), type="character", default=NULL, help="Observation (reference) data file", metavar="character"),
+    make_option(c("-s", "--simulation"), type="character", default=NULL, help="Simulation from WRF model (normally historical period)", metavar="character"),
+    make_option(c("-p", "--projection"), type="character", default=NULL, help="Future projecion from WRF model (can be historical period to use conventional quantile mapping)", metavar="character"),
+    make_option(c("-b", "--biascorrected"), type="character", default=NULL, help="Bias corrected output file", metavar="character"),
+    make_option(c("-v", "--validation"), type="character", default=NULL, help="Few statistical validations, e.g., CramerVonMises, KolmogorovSmirnov", metavar="character")
+); 
+ 
+# Function for applying CDFt
+f_cdft <- function (O, Gp, Gf) {
+  # Use the CDFt method
+  CT <- CDFt(O,Gp,Gf)
+  ds <- CT$DS
+  # 
+  return(ds)
+}
+
+# Function for applying QM
+# Thank Dr. Vrac, what a circle of life 
+f_qm <- function(ObsRp, DataGp){
+  # Use 1000 bins
+  npas=1000
+
+  # Learn from Vrac (2009)
+  # Shift the mean !
+  # Should I mention it in the paper 
+  mO = mean(ObsRp, na.rm=TRUE)
+  mGp= mean(DataGp, na.rm=TRUE)
+  DataGp2 = DataGp + (mO-mGp)
+
+  FRp=ecdf(ObsRp)
+  FGp=ecdf(DataGp2)
+
+  m=min(ObsRp, DataGp, na.rm=TRUE)
+  M=max(ObsRp, DataGp, na.rm=TRUE)
+
+  x=seq(m,M,,npas)
+
+  FRP=FRp(x)
+  FGP=FGp(x)
+
+  # Quantile-matching
+  No.NaNs.indices = which(!is.na(DataGp2))
+  
+  qntl = array(NaN, dim=length(DataGp2))
+  qntl[No.NaNs.indices] = FGp(DataGp2[No.NaNs.indices])
+  
+  xx = array(NaN, dim=length(DataGp2))
+  xx = approx(FRP,x,qntl,yleft=x[1],yright=x[length(x)],ties='mean')
+
+  # Return values
+  # Need CDF ? later !
+  return(xx$y)
+}
+
+# Funtion for "Singularity Stochastic Removal" (SSR)
+ssr <- function (t, th) {
+  # Over careful guy !
+  t_new <- t
+  # A random variable distributed uniformly between 0 and th
+  # "runif() will not generate either of the extreme values 
+  # unless max = min or max-min is small compared to min !
+  z <- runif(length(t_new), min=0, max=th)
+  # Replacing
+  id <- t_new == 0 & !is.na(t_new)
+  t_new[id] <- z[id]
+  #
+  return(t_new)
+}
+
+# Read arguments 
+opt_parser = OptionParser(option_list=option_list);
+opt = parse_args(opt_parser);
+
+if (is.null(opt$observation)){
+  print_help(opt_parser)
+  stop("At least one argument must be supplied (input file).n", call.=FALSE)
+}
+
+# Read option for QM (historical period) or CDFt (future)
+type <- opt$type
+if ( type != "QM" & type != "CDFt") {
+    print ("ERROR : Please select valid correction method (QM or CDFt)!")
+    stop()
+}
+
+# Read station data
+obs <- read.csv(file = opt$observation)
+
+# Read historical simulations
+his <- read.csv(file = opt$simulation)
+
+# Read future projections
+pro <- read.csv(file = opt$projection)
+
+# Take "Time" column for bias-corrected data
+out <- data.frame(pro[,1])
+colnames(out)[ncol(out)] <- 'Time'
+
+# Saving some statistics test
+statout <- data.frame(matrix(ncol=4, nrow=0))
+tmp <- c('CVM_before','CVM_after','KS_before','KS_after')
+colnames(statout) <- tmp
+
+# First columns is "Time"
+for ( i in colnames(obs)[2:length(colnames(obs))]) {
+
+  # Get one series each time
+  O <- as.numeric(obs[,i])
+  Gp <- as.numeric(his[,i])
+  Gf <- as.numeric(pro[,i])
+
+  # Determine a positive precipitation threshold th
+  th <- min(O[O>0], Gp[Gp>0], Gf[Gf>0], na.rm=TRUE)
+  
+  # Singularity Stochastic Removal
+  O_ssr <- ssr(O,th)
+  Gp_ssr <- ssr(Gp,th)
+  Gf_ssr <- ssr(Gf,th)
+  
+  # Now use CDFt function
+  if ( type == "CDFt" ) {
+      bc <- f_cdft(O_ssr, Gp_ssr, Gf_ssr)
+  } else if ( type == "QM" ) {
+      bc <- f_qm(O_ssr, Gp_ssr)
+  }
+  
+  # Bias-corrected data lower than th are set to 0
+  bc[bc < th] <- 0
+  
+  # Add to output
+  out[,i] <- bc
+  colnames(out)[ncol(out)] <- paste(i)
+  
+  # Some statistics tests
+  cvm_b <- CramerVonMisesTwoSamples(O,Gf)
+  cvm_a <- CramerVonMisesTwoSamples(O,bc)
+  
+  ks_b <- KolmogorovSmirnov(O,Gf)
+  ks_a <- KolmogorovSmirnov(O,bc)
+  
+  statout[nrow(statout) + 1, ] <- c(cvm_b,cvm_a,ks_b,ks_a)
+}
+
+# Write output
+write.csv(out,file = opt$biascorrected, row.names=FALSE)
+write.csv(statout,file = opt$validation, row.names=FALSE)
