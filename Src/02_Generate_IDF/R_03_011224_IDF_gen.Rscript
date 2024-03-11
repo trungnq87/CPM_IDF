@@ -61,7 +61,7 @@ nameduration <- as.character(unlist(strsplit(namedd, ",")))
 # Function for fitting GEV distribution
 # Find CI of ERL and distribution of parameters
 # Selecting "non-stationary" or stationary by ifnon
-gev_fitting <- function (ifnon, fit, yr, fq, nr, p, dur) {
+gev_fitting <- function (ifnon, fit, yr, nr, p, dur) {
   #
   # Currently, the ci function does not work for effective
   # return levels. There were coding issues encountered.
@@ -73,9 +73,6 @@ gev_fitting <- function (ifnon, fit, yr, fq, nr, p, dur) {
   # of data from the fitted model of the
   # same length as the data. Each column
   # is a separate sample.
-  sam <- numeric(0)
-  # I still want to save the CI of ERL
-  # for uncertainty assessment (in future!)
   #
   # "stnr" or station ID/number will be '1' now
   # No need to add it, but we can, if we want !
@@ -88,7 +85,6 @@ gev_fitting <- function (ifnon, fit, yr, fq, nr, p, dur) {
       for( i in 1:nr) {
           dat <- data.frame(z=z[,i], annee=yr)
           res <- fevd(z, dat, location.fun=~annee, method="GMLE")
-          sam <- cbind(sam, c(erlevd(res)))
           # Get fitting parameters
           para <- findpars(res)
           # Oh, lengthy commands, I should be more pro with R ? 
@@ -104,7 +100,6 @@ gev_fitting <- function (ifnon, fit, yr, fq, nr, p, dur) {
           a <- rextRemes(fit, n=length(yr))
           dat <- data.frame(z=a)
           res <- fevd(z, dat, method="GMLE")
-          sam <- cbind(sam, c(erlevd(res, period=fq)))
           # Get fitting parameters
           para <- findpars(res)
           # Oh, lengthy commands, I should be more pro with R ? 
@@ -115,25 +110,57 @@ gev_fitting <- function (ifnon, fit, yr, fq, nr, p, dur) {
           theta[nrow(theta) + 1, ] <- c(as.numeric(1),as.numeric(dur),location,scale,shape)
           }
   }
-  #
-  res <- apply(sam, 1, quantile, probs=c(p/2, 1 - p/2))
-  # If you need "names", uncomment this line
-  #nm <- rownames(res)
-  res <- cbind(res[1,], res[2,])
-  # Skip column names
-  #colnames(res) <- c(nm[1], nm[2])
-  # ATTENTION: the last row idea !!! Hum,...
-  # Deal with non-stationary for RCP 4.5 and RCP 8.5
-  # Not really good idea, but what else ?
-  # Note: maximum or middle point is also controversial !
-  return(list("erl" = as.numeric(tail(res, n=1)), "theta" = theta))
+  return(list("theta" = theta))
 }
 
-# The first type of output files
-# Saving non-stationary flag, low/high range of return levels
-out01 <- data.frame(matrix(ncol=3, nrow=0))
-tmp <- c('Non-stationary flag','Low','High')
-colnames(out01) <- tmp
+# Function to find the "suitable" parameter set 
+# based on selected "quantile"
+# E.g., quantile has 100 increments but we might have 10000 parameter sets
+# due to chosen Bootstrap sample size
+# srl : selected return level
+# gev_in : it's gev_out in this code
+get_para <- function(srl,gev_in,p,ret.periods=c(5,10,20,50,100)){
+    
+    # Declare R array as a newbie
+    miu <- srl ; sigma <- srl ; xi <- srl ; low_rl <- srl ; high_rl <- srl
+    miu[]=NA ; sigma[]=NA ; xi[]=NA ; low_rl[]=NA ; high_rl[]=NA
+
+    # For all durations
+    durs=sort(as.numeric(unique(gev_in$duration)))
+    for(d in 1:length(durs)){
+        
+        tmp=gev_in[which(gev_in$duration==durs[d]),]
+
+        # For all return periods  
+        j=0
+        for(ii in ret.periods){
+
+            j=j+1
+            allrl <- compute_ret_level(location=tmp$location,scale=tmp$scale ,shape=tmp$shape,ret.per=ii)
+
+            # Find the value that is closest to selected return level
+            maxless <- max(allrl[allrl <= srl[[d,j]]])
+            # Find out the index of this value
+            ind <- which(allrl == maxless)
+
+            # Get the parameters
+            miu[[d,j]] <- tmp$location[ind]
+            sigma[[d,j]] <- tmp$scale[ind]
+            xi[[d,j]] <- tmp$shape[ind]
+
+            # Get uncertainty (CI) range
+            sam <- data.frame(allrl)
+            res <- apply(t(sam), 1, quantile, probs=c(p/2, 1 - p/2))
+            # ATTENTION: the last row idea !!! Hum,...
+            # Deal with non-stationary for RCP 4.5 and RCP 8.5
+            # Not really good idea, but what else ?
+            # Note: maximum or middle point is also controversial !
+            low_rl[[d,j]] <- res[1,]
+            high_rl[[d,j]] <- res[2,]
+        }
+    }
+  return(list("loc" = miu, "scale" = sigma, "shape" = xi, "lower" = low_rl, "upper" =high_rl))
+}
 
 # Drop NaN values
 # You can try to not drop NaN for all columns
@@ -149,57 +176,51 @@ colnames(gev_out) <- tmp
 # I should learn R better to avoid this kind of command lines
 count <- 0
 
-# Loops for all frequencies and durations
-for ( j in freq ) {
+# Saving non-stationary flag
+flaglist <- data.frame(matrix(ncol=2, nrow=0))
+tmp <- c('Duration','Non-stationary flag')
+colnames(flaglist) <- tmp
 
-  ii <- 0
+# Loops for all durations
+ii <- 0
+# First columns of df is "Year"
+for ( i in colnames(df)[2:length(colnames(df))]) {
 
-  # First columns of df is "Year"
-  for ( i in colnames(df)[2:length(colnames(df))]) {
+  # Select only durations that you want to use
+  if ( i %in% nameduration ) {
 
-    # Select only durations that you want to use
-    if ( i %in% nameduration ) {
-
-        # Counting
-        count <- count + 1 
-        ii <- ii + 1
-    
-        # Get one series to test
-        a <- as.numeric(df[,i])
-        
-        # Fit stationary GEV
-        fit1 <- fevd(a, method="GMLE")
-        
-        # Fit non-stationary GEV(co-variate with ~Year)
-        fit2 <- fevd(a, location.fun=~yr, method="GMLE")
-        
-        # Likelihood ratio test
-        ## Get only p-value (still story of CI, but later)
-        p = lr.test(fit1,fit2)$p.value
-        
-        flag=0
-        # Now you know which one is more suitable
-        # 'Y' : nonstationary and 'N' : stationary
-        if ( p < alpha ) {
-          flag='Y'
-          tmp <- gev_fitting(TRUE, fit2, yr, j, nboot, alpha, duration[ii])
-        } else {
-          flag='N'
-          tmp <- gev_fitting(FALSE, fit1, yr, j, nboot, alpha, duration[ii])
-        }
+      # Counting
+      count <- count + 1 
+      ii <- ii + 1
+  
+      # Get one series to test
+      a <- as.numeric(df[,i])
       
-        # Get "theta" array for compute_quantiles()
-        gev_out <- rbind(gev_out,tmp$theta)
+      # Fit stationary GEV
+      fit1 <- fevd(a, method="GMLE")
+      
+      # Fit non-stationary GEV(co-variate with ~Year)
+      fit2 <- fevd(a, location.fun=~yr, method="GMLE")
+      
+      # Likelihood ratio test
+      ## Get only p-value (still story of CI, but later)
+      p = lr.test(fit1,fit2)$p.value
+      
+      flag=0
+      # Now you know which one is more suitable
+      # 'Y' : nonstationary and 'N' : stationary
+      if ( p < alpha ) {
+        flaglist[nrow(flaglist) + 1, ] <- c(duration[ii],'Y')
+        tmp <- gev_fitting(TRUE, fit2, yr, nboot, alpha, duration[ii])
+      } else {
+        flaglist[nrow(flaglist) + 1, ] <- c(duration[ii],'N')
+        tmp <- gev_fitting(FALSE, fit1, yr, nboot, alpha, duration[ii])
+      }
     
-        # Save array to write output later
-        out01[nrow(out01) + 1, ] <- c(flag,tmp$erl)
-
-    }
- }
+      # Get "theta" array for compute_quantiles()
+      gev_out <- rbind(gev_out,tmp$theta)
+  }
 }
-
-# Write output of range for ERL in gev_fitting
-write.csv(out01,file = opt$gevfile, row.names=FALSE)
 
 # Now, quantile selection algorithm
 
@@ -224,3 +245,32 @@ out02 <- res_alg$adjusted.curves
 
 # Saving IDF curves output
 write.csv(out02,file = opt$idffile)
+
+# To get "selected" parameter sets
+# should be flexible with any Bootstrap sample size
+out01=get_para(out02,gev_out,alpha,ret.period=freq)
+
+# Write output of range for ERL and used parameter sets
+write( "\n === Location parameter === \n", file = opt$gevfile, append = F)
+write.table( out01$loc,file = opt$gevfile,append = T,sep = ",",
+             row.names = T,col.names = T,na="",quote = T)
+
+write( "\n === Scale parameter === \n", file = opt$gevfile, append = T)
+write.table( out01$scale,file = opt$gevfile,append = T,sep = ",",
+             row.names = T,col.names = T,na="",quote = T)
+
+write( "\n === Shape parameter === \n", file = opt$gevfile, append = T)
+write.table( out01$shape,file = opt$gevfile,append = T,sep = ",",
+             row.names = T,col.names = T,na="",quote = T)
+
+write( "\n === Lower CI bound of ERL === \n", file = opt$gevfile, append = T)
+write.table( out01$lower,file = opt$gevfile,append = T,sep = ",",
+             row.names = T,col.names = T,na="",quote = T)
+
+write( "\n === Upper CI bound of ERL === \n", file = opt$gevfile, append = T)
+write.table( out01$upper,file = opt$gevfile,append = T,sep = ",",
+             row.names = T,col.names = T,na="",quote = T)
+
+write( "\n === Check flag for non-stationarity === \n", file = opt$gevfile, append = T)
+write.table( flaglist,file = opt$gevfile,append = T,sep = ",",
+             row.names = T,col.names = T,na="",quote = T)
